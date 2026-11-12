@@ -1,6 +1,11 @@
 const net = require("net")
 
 const server = net.createServer((socket) => {
+    let incomingBodyChunks = Buffer.alloc(0);
+    let bodyBytes = 0;
+    let headersParsed = false;
+
+
     socket.on("data", (data) => {
         const requestArr = data.toString().split('\r\n')
 
@@ -26,7 +31,15 @@ const server = net.createServer((socket) => {
             finalHeaders[header.slice(0, firstColon).toLowerCase()] = header.slice(firstColon + 1).trim()
         }
 
-        console.log(finalHeaders)
+        // Body Parsing
+        const bodyStart = data.indexOf("\r\n\r\n");
+        const body = bodyStart !== -1 ? data.subarray(bodyStart + 4) : Buffer.alloc(0);
+
+
+
+
+
+        console.log(body)
 
     })
 
