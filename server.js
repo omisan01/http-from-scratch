@@ -1,7 +1,6 @@
 const net = require("net")
 
 const server = net.createServer((socket) => {
-
     let headersParsed = false;
     let incomingBuffer = Buffer.alloc(0)
 
@@ -15,8 +14,6 @@ const server = net.createServer((socket) => {
     // Body
     let incomingBodyChunks = Buffer.alloc(0);
     let bodyBytes = 0;
-
-
 
     socket.on("data", (data) => {
         // If headers are parsed then dont parse it again
