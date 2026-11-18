@@ -1,7 +1,21 @@
 const { registerRoute, findRoute, findRouteByPathname } = require("./router")
+const { getStaticFile } = require("./static/staticFileHandler");
+
 const net = require("net")
 
 const MAX_BODY_SIZE = 1024 * 1024;
+
+const staticFileErrorsMap = {
+    403: "Forbidden",
+    404: "File not found",
+    500: "Internal Server Error"
+}
+
+const fileSystemErrorMap = {
+    INVALID_PATH: 403,
+    ENOENT: 404,
+    ENOTDIR: 404
+};
 
 const server = net.createServer((socket) => {
     let headersParsed = false;
@@ -18,7 +32,7 @@ const server = net.createServer((socket) => {
     let incomingBodyChunks = Buffer.alloc(0);
     let bodyBytes = 0;
 
-    socket.on("data", (data) => {
+    socket.on("data", async (data) => {
         // If headers are parsed then dont parse it again
         if (!headersParsed) {
             incomingBuffer = Buffer.concat([incomingBuffer, data])
@@ -144,13 +158,38 @@ const server = net.createServer((socket) => {
 
             const existingRoutes = findRouteByPathname(pathname)
             if (existingRoutes.length === 0) {
-                const routeErr = JSON.stringify({ error: "Route not found" })
-                const routeErrByteLength = Buffer.byteLength(routeErr)
-                socket.end(responseBuilder(404, "Not Found", {
-                    "Content-Type": "application/json",
-                    "Content-Length": routeErrByteLength
-                }, routeErr))
-                return;
+                if (method === "GET") {
+                    console.log("Requested pathname:", pathname);
+                    console.log("Normalized path:", pathname.slice(1));
+
+                    const staticFileRes = await getStaticFile(pathname.slice(1))
+                    if (staticFileRes.error) {
+                        const httpStatus = fileSystemErrorMap[staticFileRes.error.code] || 500;
+
+                        socket.end(responseBuilder(httpStatus, staticFileErrorsMap[httpStatus], {
+                            "Content-Type": "text/plain",
+                            "Content-Length": Buffer.byteLength(staticFileErrorsMap[httpStatus])
+                        }, staticFileErrorsMap[httpStatus]))
+                        return;
+                    }
+
+                    const staticFileResHeaders = {
+                        "Content-Type": staticFileRes.mimeType,
+                        "Content-Length": staticFileRes.data.length
+                    }
+
+                    socket.write(responseBuilder(200, "OK", staticFileResHeaders));
+                    socket.end(staticFileRes.data)
+                    return
+                } else {
+                    const routeErr = JSON.stringify({ error: "Route not found" })
+                    const routeErrByteLength = Buffer.byteLength(routeErr)
+                    socket.end(responseBuilder(404, "Not Found", {
+                        "Content-Type": "application/json",
+                        "Content-Length": routeErrByteLength
+                    }, routeErr))
+                    return;
+                }
             }
 
             const route = findRoute(method, pathname)
@@ -211,12 +250,13 @@ registerRoute("GET", "/users", (req, res) => {
     };
 
 });
-registerRoute("POST", "/users", () => {
+registerRoute("POST", "/users", (req) => {
     return {
         status: 201,
         statusText: "Created",
         body: {
-            message: "User created"
+            received: req.body
+
         }
     };
 
