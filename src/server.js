@@ -6,237 +6,182 @@ const net = require("net")
 const MAX_BODY_SIZE = 1024 * 1024;
 
 const staticFileErrorsMap = {
+    400: "Bad Request",
     403: "Forbidden",
     404: "File not found",
     500: "Internal Server Error"
-}
+};
 
 const fileSystemErrorMap = {
+    BAD_PATH: 400,
     INVALID_PATH: 403,
     ENOENT: 404,
-    ENOTDIR: 404
+    ENOTDIR: 404,
+    EISDIR: 404
+};
+
+const STATUS_TEXT = {
+    200: "OK",
+    201: "Created",
+    204: "No Content",
+    400: "Bad Request",
+    403: "Forbidden",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    413: "Payload Too Large",
+    431: "Request Header Fields Too Large",
+    500: "Internal Server Error"
 };
 
 const server = net.createServer((socket) => {
-    let headersParsed = false;
     let incomingBuffer = Buffer.alloc(0)
-
-    // Route, Queries and Headers
-    let requestLine = ""
-    let query = "";
-    let pathname = "";
-    let method, target, version = "";
-    const finalHeaders = {}
-
-    // Body
-    let incomingBodyChunks = Buffer.alloc(0);
-    let bodyBytes = 0;
+    let isProcessing = false;
+    let closed = false;
 
     socket.on("data", async (data) => {
-        // If headers are parsed then dont parse it again
-        if (!headersParsed) {
-            incomingBuffer = Buffer.concat([incomingBuffer, data])
-            const bodyStart = incomingBuffer.indexOf("\r\n\r\n");
-            if (bodyStart === - 1) return;
+        if (closed) return;
+        incomingBuffer = Buffer.concat([incomingBuffer, data])
 
-            const requestArr = incomingBuffer.subarray(0, bodyStart).toString().split('\r\n')
-            requestLine = requestArr[0];
-            const parts = requestLine.trim().split(/\s+/);
+        if (isProcessing) return;
 
-            if (parts.length !== 3) {
-                const reqLineErr = JSON.stringify({ error: "Malformed Request" })
-                const reqErrByteLength = Buffer.byteLength(reqLineErr);
-                socket.end(responseBuilder(400, "Bad Request", {
-                    "Content-Type": "application/json",
-                    "Content-Length": reqErrByteLength
-                }, reqLineErr))
-                return;
-            };
-
-
-            // Request Line with method, target and version
-            [method, target, version] = parts
-
-            if (!method || !target || version !== "HTTP/1.1") {
-                const reqLineErr = JSON.stringify({ error: "Invalid Request" })
-                const reqErrByteLength = Buffer.byteLength(reqLineErr);
-
-                socket.end(responseBuilder(400, "Bad Request", {
-                    "Content-Type": "application/json",
-                    "Content-Length": reqErrByteLength
-                }, reqLineErr))
-                return;
-            }
-
-            const queryStart = target.indexOf("?")
-            if (queryStart === -1) {
-                pathname = target
-            } else {
-                pathname = target.slice(0, queryStart)
-                query = target.slice(queryStart + 1)
-            }
-
-            // Headers Array
-            const headersArray = requestArr.slice(1)
-
-            for (let header of headersArray) {
-                const headerErr = JSON.stringify({ error: "Invalid Header" })
-                const headerErrByteLength = Buffer.byteLength(headerErr);
-                const firstColon = header.indexOf(':')
-                if (firstColon <= 0 || header.slice(0, firstColon).trim() === "") {
-                    socket.end(responseBuilder(400, "Bad Request", {
-                        "Content-Type": "application/json",
-                        "Content-Length": headerErrByteLength
-                    }, headerErr))
-                    return;
-                }
-
-                const headerName = header.slice(0, firstColon).trim().toLowerCase()
-                finalHeaders[headerName] = header.slice(firstColon + 1).trim()
-            }
-
-            // Set incoming body chunks
-            incomingBodyChunks = incomingBuffer.subarray(bodyStart + 4)
-            bodyBytes = incomingBodyChunks.length
-            if (bodyBytes > MAX_BODY_SIZE) {
-                const bodyLengthErr = JSON.stringify({ error: "Body length cannot exceed 1 MB" })
-                const bodyErrByteLength = Buffer.byteLength(bodyLengthErr)
-
-                socket.end(responseBuilder(413, "Payload Too Large", {
-                    "Content-Type": "application/json",
-                    "Content-Length": bodyErrByteLength
-                }, bodyLengthErr))
-                return;
-            }
-            headersParsed = true
-        } else {
-            incomingBodyChunks = Buffer.concat([incomingBodyChunks, data])
-            bodyBytes += data.length
-            if (bodyBytes > MAX_BODY_SIZE) {
-                const bodyLengthErr = JSON.stringify({ error: "Body length cannot exceed 1 MB" })
-                const bodyErrByteLength = Buffer.byteLength(bodyLengthErr)
-
-                socket.end(responseBuilder(413, "Payload Too Large", {
-                    "Content-Type": "application/json",
-                    "Content-Length": bodyErrByteLength
-                }, bodyLengthErr))
-                return;
-            }
-        }
-        const expectedLength = Number(finalHeaders["content-length"] || 0);
-
-        if (expectedLength > MAX_BODY_SIZE) {
-            const bodyLengthErr = JSON.stringify({ error: "Body length cannot exceed 1 MB" })
-            const bodyErrByteLength = Buffer.byteLength(bodyLengthErr)
-
-            socket.end(responseBuilder(413, "Payload Too Large", {
-                "Content-Type": "application/json",
-                "Content-Length": bodyErrByteLength
-            }, bodyLengthErr))
-            return;
-        }
-
-        if (bodyBytes === expectedLength) {
-            let body = incomingBodyChunks.toString();
-
-            const contentType = (finalHeaders["content-type"] || "").split(";")[0].trim().toLowerCase()
-
-            if (contentType === 'application/json') {
-                try {
-                    body = JSON.parse(body)
-                } catch (e) {
-                    const errorResponseBody = JSON.stringify({ error: "Invalid JSON" })
-                    const errByteLength = Buffer.byteLength(errorResponseBody)
-                    const res = responseBuilder(400, "Bad Request", {
-                        "Content-Type": "application/json",
-                        "Content-Length": errByteLength
-                    }, errorResponseBody)
-                    socket.end(res)
-                    return;
-                }
-            }
-
-            const existingRoutes = findRouteByPathname(pathname)
-            if (existingRoutes.length === 0) {
-                if (method === "GET") {
-                    console.log("Requested pathname:", pathname);
-                    console.log("Normalized path:", pathname.slice(1));
-
-                    const staticFileRes = await getStaticFile(pathname.slice(1))
-                    if (staticFileRes.error) {
-                        const httpStatus = fileSystemErrorMap[staticFileRes.error.code] || 500;
-
-                        socket.end(responseBuilder(httpStatus, staticFileErrorsMap[httpStatus], {
-                            "Content-Type": "text/plain",
-                            "Content-Length": Buffer.byteLength(staticFileErrorsMap[httpStatus])
-                        }, staticFileErrorsMap[httpStatus]))
-                        return;
-                    }
-
-                    const staticFileResHeaders = {
-                        "Content-Type": staticFileRes.mimeType,
-                        "Content-Length": staticFileRes.data.length
-                    }
-
-                    socket.write(responseBuilder(200, "OK", staticFileResHeaders));
-                    socket.end(staticFileRes.data)
-                    return
-                } else {
-                    const routeErr = JSON.stringify({ error: "Route not found" })
-                    const routeErrByteLength = Buffer.byteLength(routeErr)
-                    socket.end(responseBuilder(404, "Not Found", {
-                        "Content-Type": "application/json",
-                        "Content-Length": routeErrByteLength
-                    }, routeErr))
-                    return;
-                }
-            }
-
-            const route = findRoute(method, pathname)
-            if (!route) {
-                const allowedMethods = existingRoutes.map((route) => route.method).join(", ")
-                const routeMethodErr = JSON.stringify({ error: "Method not allowed" })
-                const routeErrByteLength = Buffer.byteLength(routeMethodErr)
-                socket.end(responseBuilder(405, "Method Not Allowed", {
-                    "Content-Type": "application/json",
-                    "Content-Length": routeErrByteLength,
-                    "Allow": allowedMethods
-                }, routeMethodErr))
-                return;
-            }
-
-            const queryParams = Object.fromEntries(new URLSearchParams(query))
-
-            const request = {
-                method,
-                pathname,
-                query: queryParams,
-                headers: finalHeaders,
-                body,
-                params: route.params
-            }
-
-            const { status, statusText, body: resBody } = route.handler(request)
-
-            if (status === 204) {
-                socket.end(responseBuilder(204, "No Content"))
-                return
-            }
-
-            const responseString = JSON.stringify(resBody);
-            const byteLength = Buffer.byteLength(responseString)
-
-            const res = responseBuilder(status, statusText, {
-                "Content-Type": "application/json",
-                "Content-Length": byteLength
-            }, responseString)
-            socket.end(res)
-        }
+        await processBuffer();
     })
+
+    socket.on("close", () => { closed = true; });
 
     socket.on("error", (err) => {
         console.error("Socket error:", err.message);
     });
+
+    const processBuffer = async () => {
+        isProcessing = true;
+        try {
+            while (true) {
+                const parsedReqRes = parseRequest(incomingBuffer)
+
+                if (!parsedReqRes) break;
+
+                if (parsedReqRes.error) {
+                    sendError(parsedReqRes.status, parsedReqRes.error)
+                    return;
+                }
+
+                incomingBuffer = incomingBuffer.subarray(parsedReqRes.consumed);
+
+                const shouldClose = (parsedReqRes.headers["connection"] || "").toLowerCase() === "close";
+                const response = await handleRequest(parsedReqRes, shouldClose)
+
+                if (socket.destroyed) return;
+
+                if (shouldClose) {
+                    socket.end(response)
+                    return;
+                }
+                socket.write(response)
+            }
+        } catch (err) {
+            console.error("Handler error:", err.message);
+            if (!socket.destroyed) sendError(500, "Internal Server Error");
+            return;
+        } finally {
+            isProcessing = false
+        }
+
+    }
+
+    const sendError = (status, message) => {
+        const body = JSON.stringify({ error: message })
+        socket.end(responseBuilder(status, STATUS_TEXT[status], {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            "Connection": "close"
+        }, body))
+    }
+
+
+    const handleRequest = async (request, shouldClose) => {
+        let body = request.body.toString();
+
+        const contentType = (request.headers["content-type"] || "").split(";")[0].trim().toLowerCase()
+
+        const existingRoutes = findRouteByPathname(request.pathname)
+        if (existingRoutes.length === 0) {
+            if (request.method !== "GET") {
+                return jsonResponse(404, { error: "Route Not found" }, {}, shouldClose)
+            }
+
+            const file = await getStaticFile(request.pathname.slice(1));
+            if (file.error) {
+                const status = fileSystemErrorMap[file.error.code] || 500;
+                return jsonResponse(status, { error: staticFileErrorsMap[status] }, {}, shouldClose)
+            }
+
+            const headers = {
+                "Content-Type": file.mimeType,
+                "Content-Length": file.bytes
+            };
+            if (shouldClose) headers["Connection"] = "close";
+
+            const head = responseBuilder(200, "OK", headers);
+            return Buffer.concat([Buffer.from(head), file.data]);
+        }
+
+        const route = findRoute(request.method, request.pathname);
+
+        if (!route) {
+            const allowed = existingRoutes.map((route) => route.method).join(", ");
+            return jsonResponse(405, { error: "Method not allowed" }, { Allow: allowed }, shouldClose)
+        }
+
+        if (contentType === 'application/json' && body.length > 0) {
+            try {
+                body = JSON.parse(body);
+            } catch (e) {
+                return jsonResponse(400, { error: "Invalid JSON" }, {}, shouldClose);
+            }
+        }
+
+        const queryParams = Object.fromEntries(new URLSearchParams(request.query));
+
+        const req = {
+            method: request.method,
+            pathname: request.pathname,
+            query: queryParams,
+            headers: request.headers,
+            body,
+            params: route.params
+        };
+
+        let result;
+        try {
+            result = await route.handler(req);
+        } catch (err) {
+            console.error("Route handler threw:", err.message);
+            return jsonResponse(500, { error: "Internal Server Error" }, {}, shouldClose);
+        }
+
+        if (!result || typeof result.status !== "number") {
+            return jsonResponse(500, { error: "Handler returned an invalid response" }, {}, shouldClose);
+        }
+
+        if (result.status === 204) {
+            const headers = shouldClose ? { Connection: "close" } : {};
+            return responseBuilder(204, "No Content", headers);
+        }
+
+        return jsonResponse(result.status, result.body ?? null, {}, shouldClose);
+    };
+
+    const jsonResponse = (status, obj, extraHeaders = {}, shouldClose = false) => {
+        const body = JSON.stringify(obj);
+        const headers = {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            ...extraHeaders
+        };
+        if (shouldClose) headers["Connection"] = "close";
+        return responseBuilder(status, STATUS_TEXT[status], headers, body);
+    };
 
 })
 
@@ -302,4 +247,74 @@ const responseBuilder = (status, statusCode, headers = {}, body = "", version = 
         return `${key}: ${value}\r\n`
     }).join("")
     return `${version} ${status} ${statusCode}\r\n${additionalHeaders}\r\n${body}`
-} 
+}
+
+const MAX_HEADER_SIZE = 8 * 1024;
+
+const parseRequest = (buffer) => {
+    const bodyStart = buffer.indexOf("\r\n\r\n")
+
+    if (bodyStart === -1) {
+        if (buffer.length > MAX_HEADER_SIZE) {
+            return { error: "Headers too large", status: 431 }
+        }
+        return null;
+    }
+
+    if (bodyStart > MAX_HEADER_SIZE) {
+        return { error: "Headers too large", status: 431 }
+    }
+
+    const requestArr = buffer.subarray(0, bodyStart).toString().split('\r\n')
+    const parts = requestArr[0].trim().split(/\s+/);
+
+    if (parts.length !== 3) {
+        return { error: "Malformed Request", status: 400 };
+    };
+
+    // Request Line with method, target and version
+    const [method, target, version] = parts
+
+    if (!method || !target || version !== "HTTP/1.1") {
+        return { error: "Invalid Header", status: 400 }
+    }
+
+
+
+    const queryStart = target.indexOf("?")
+    const pathname = queryStart === -1 ? target : target.slice(0, queryStart);
+    const query = queryStart === -1 ? "" : target.slice(queryStart + 1);
+
+
+    // Headers Array
+    const headers = {}
+
+    for (let header of requestArr.slice(1)) {
+        const firstColon = header.indexOf(':')
+        if (firstColon <= 0 || header.slice(0, firstColon).trim() === "") {
+            return { error: "Invalid Header", status: 400 }
+        }
+
+        const name = header.slice(0, firstColon).trim().toLowerCase()
+        headers[name] = header.slice(firstColon + 1).trim()
+    }
+
+    const rawLength = headers["content-length"] ?? "0"
+    if (!/^\d+$/.test(rawLength)) {
+        return { error: "Invalid Content-Length", status: 400 }
+    }
+
+    const contentLength = Number(rawLength);
+
+    if (contentLength > MAX_BODY_SIZE) {
+        return { error: "Body Length cannot exceed 1MB", status: 413 }
+    }
+
+    const totalLength = bodyStart + 4 + contentLength;
+    if (buffer.length < totalLength) return null;  // Body not fully arrived
+
+    const body = buffer.subarray(bodyStart + 4, totalLength);
+
+    return { method, pathname, query, headers, body, consumed: totalLength }
+}
+
